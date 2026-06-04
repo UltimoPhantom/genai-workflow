@@ -31,7 +31,7 @@ import logging
 
 import redis as redis_lib
 
-from config import REDIS_URL, TTS_MAX_CONCURRENCY, LEASE_SECONDS
+from config import REDIS_URL, TTS_MAX_CONCURRENCY, LEASE_SECONDS, TTS_SIMULATE_SECS
 
 log = logging.getLogger("worker.locks")
 
@@ -39,7 +39,14 @@ _redis: redis_lib.Redis | None = None
 
 SEMAPHORE_KEY   = "tts:semaphore"
 CACHE_PREFIX    = "tts:cache:"
-CACHE_LOCK_TTL  = LEASE_SECONDS + 30   # lock held while synthesis runs
+# The stampede lock only needs to outlive ONE synthesis. Tying it to the long
+# task lease (LEASE+30) was a bug: a worker that dies holding this lock would
+# strand every other worker synthesising the same hash for the full TTL. Keep
+# it just above synthesis time so an orphaned lock clears fast and a survivor
+# can take over. If a legit synthesis ever overran this, the worst case is a
+# duplicate (idempotent) synthesis — never corruption.
+CACHE_LOCK_TTL    = max(int(TTS_SIMULATE_SECS * 3), 10)
+CACHE_WAIT_TIMEOUT = 120.0   # overall ceiling for obtaining a cached result
 
 
 def get_redis() -> redis_lib.Redis:
@@ -59,6 +66,7 @@ def sem_acquire(holder_id: str, timeout: float = 120.0) -> bool:
     r         = get_redis()
     deadline  = time.monotonic() + timeout
     lease_ttl = LEASE_SECONDS
+    logged_full = False
 
     while time.monotonic() < deadline:
         now = time.time()
@@ -68,6 +76,12 @@ def sem_acquire(holder_id: str, timeout: float = 120.0) -> bool:
             pipe.zremrangebyscore(SEMAPHORE_KEY, "-inf", now - lease_ttl)
             pipe.zcard(SEMAPHORE_KEY)
             _, count = pipe.execute()
+
+        if count >= TTS_MAX_CONCURRENCY and not logged_full:
+            # Make the cap engaging visible: this holder is being throttled.
+            log.info("sem FULL (%d/%d) holder=%s waiting for a slot",
+                     count, TTS_MAX_CONCURRENCY, holder_id)
+            logged_full = True
 
         if count < TTS_MAX_CONCURRENCY:
             # Try to claim a slot — use a Lua script so trim+add is atomic

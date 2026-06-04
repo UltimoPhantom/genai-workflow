@@ -184,8 +184,10 @@ both exist → next-stage idempotency absorbs the duplicate).
 - 🟡 Semaphore vs backoff interaction → release slot before backing off.
 
 **Stitch**
-- 🔴 Partial completion → stitch only when all chunks DONE; the completion check
-  races (two workers see count 0) → guard with atomic job state flip.
+- 🔴 Partial completion → stitch only when all chunks DONE. The completion check
+  itself races: two final chunks committing concurrently both *undercount* and
+  neither flips → job stuck. Guard with `SELECT … FOR UPDATE` on the job row
+  (serialises the check) + a reconciler sweep. See §9.2.
 - 🟡 Reassemble by `chunk_index`, not completion order.
 
 **Cross-cutting**
@@ -209,5 +211,70 @@ both exist → next-stage idempotency absorbs the duplicate).
 | Idempotency | Publish the same `JobCreated` twice → one COMPLETED job, no dup tasks. |
 | TTS max 3 | Submit many jobs → log shows semaphore holders never exceed 3. |
 | Cache | Submit identical text twice → 2nd skips vendor (log "cache hit", no extra sleep). |
-| DLQ + backoff | Submit a `POISON` manuscript → 3 retries w/ growing delay → lands in `tts.dlq`; other jobs keep completing. |
-| Crash recovery | `docker kill` a worker mid-TTS → another worker resumes; job still COMPLETES. |
+| DLQ + backoff | Submit a `POISON` manuscript → routed to `parse.dlq`, job marked `FAILED`; other jobs keep completing (queue not blocked). A chunk that keeps failing TTS lands in `tts.dlq` after 3 backed-off retries. |
+| Crash recovery | `docker kill` a worker mid-TTS → reaper reclaims + re-emits the orphaned task; job still COMPLETES. |
+
+---
+
+## 9. Bugs found during end-to-end verification (and the fixes)
+
+Building the happy path is easy; the assignment is really about what breaks under
+concurrency and failure. These were found by running the system hard (5 workers,
+bursts, forced kills) and reading the logs — not by reasoning alone.
+
+**9.1 The semaphore cap was never actually engaging.**
+`pika`'s `BlockingConnection` processes one message at a time per process, so the
+worker count *is* the max parallel TTS attempts. With 2 workers the global cap of
+3 could never be reached (`slots_used` peaked at `2/3`). Worse, the demo reused
+text that was already cached, so TTS returned instantly and concurrency never
+built up. **Fix:** 5 worker replicas, `prefetch=1` (so no single worker hoards
+the queue), and unique text per run (forcing real 2s synthesis). Now the demo
+provably reaches `3/3` with `sem FULL … waiting` events.
+
+**9.2 Completion-detection race left jobs stuck in PROCESSING forever.**
+Each finishing chunk did, in its own transaction, `UPDATE my task → DONE` then
+`SELECT count(*) WHERE status != 'DONE'`. Under READ COMMITTED, when the last two
+chunks commit concurrently neither transaction sees the other's DONE, both count
+`remaining ≥ 1`, and **neither flips the job to STITCHING** — all tasks DONE, job
+wedged. **Fix:** take `SELECT 1 FROM jobs WHERE id=… FOR UPDATE` before the
+count, serialising the completion check per job. Added a **stuck-job reconciler**
+to the reaper as defense-in-depth (it rescued three already-wedged jobs on first
+run).
+
+**9.3 The outbox relay published every event N times.**
+Every worker runs a relay; all of them `SELECT … WHERE published_at IS NULL` with
+no coordination, so with 5 replicas each event was published up to 5× (41
+duplicate deliveries observed). Idempotent consumers absorbed it, but it's 5× the
+broker traffic. **Fix:** `SELECT … FOR UPDATE SKIP LOCKED` so relays partition the
+outbox instead of racing. Duplicate deliveries dropped 41 → 0.
+
+**9.4 Crash recovery silently lost the task (the subtle one).**
+The reaper reset an expired-lease task to PENDING but **published nothing**. When
+a worker is killed *after* claiming (lease held) but before ack, RabbitMQ
+redelivers the message to a peer — which sees the task still IN_PROGRESS with an
+unexpired lease, treats it as a duplicate, and acks it away. So by the time the
+lease expires, *there is no message left in the broker* and the reset row never
+reprocesses. **Fix:** the reaper re-emits a fresh `jobs.tts` event (via the
+outbox) for every task it reclaims. Reset → re-emit → reprocess.
+
+**9.5 A crashed worker holding the cache stampede lock stranded everyone.**
+The stampede lock TTL was tied to the long task lease (`LEASE+30 = 90s`). A worker
+killed mid-synthesis never released its `tts:lock:{hash}`, so every other worker
+synthesising that hash sat in `cache_wait` for a winner that was dead — up to 90s
+— which then let *their* leases expire and triggered redundant re-reclaims.
+**Fix:** (a) shrink the lock TTL to ~3× synthesis time, so an orphaned lock clears
+fast; (b) make the cache path **self-healing** — instead of waiting forever on a
+peer, loop and take over the lock once it expires. Crash recovery went from 67s
+with a double-reclaim to ~34s with a single clean reclaim.
+
+**9.6 DLQ'd jobs had no terminal state.**
+A poison job reached `parse.dlq` but the `jobs` row stayed `PENDING` forever, so
+status polling never showed an outcome. **Fix:** every DLQ path now marks the job
+(and the offending task) `FAILED` with an error message, giving status pollers a
+real terminal state.
+
+**Residual, accepted:** after a lease steal the original slow worker's terminal
+`UPDATE tasks SET DONE` is unconditional, so two workers can both write DONE for
+the same chunk. It's idempotent (same content hash → same key) and the job-row
+lock keeps stitch single-fire, so it's wasted work, not corruption — left as a
+documented tradeoff rather than adding a lease-token check.

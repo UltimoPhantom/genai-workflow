@@ -171,12 +171,21 @@ def _retry_or_dlq(channel, method, msg, stage, attempt):
 
 
 def _send_to_dlq(channel, method, msg, stage):
-    dlq = f"{stage}.dlq"
+    dlq    = f"{stage}.dlq"
+    job_id = msg.get("job_id")
     channel.basic_publish(
         exchange="",
         routing_key=dlq,
         body=json.dumps(msg),
         properties=pika.BasicProperties(delivery_mode=2),
     )
-    log.error("job=%s sent to DLQ=%s", msg.get("job_id"), dlq)
+    # Terminal state: mark the job FAILED so GET /jobs shows a final status
+    # instead of leaving it stuck at PENDING forever.
+    with db.conn() as cx:
+        cx.execute(
+            "UPDATE jobs SET status='FAILED', error=%s WHERE id=%s AND status != 'COMPLETED'",
+            (f"parse stage routed to DLQ after exhausting retries", job_id),
+        )
+        cx.commit()
+    log.error("job=%s sent to DLQ=%s, job marked FAILED", job_id, dlq)
     channel.basic_ack(method.delivery_tag)

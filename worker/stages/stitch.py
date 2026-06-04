@@ -124,13 +124,22 @@ def _retry_or_dlq(channel, method, msg, attempt):
     next_attempt = attempt + 1
 
     if next_attempt > MAX_RETRIES:
+        job_id = msg["job_id"]
         channel.basic_publish(
             exchange="",
             routing_key="stitch.dlq",
             body=json.dumps(msg),
             properties=pika.BasicProperties(delivery_mode=2),
         )
-        log.error("job=%s sent to stitch.dlq", msg["job_id"])
+        # Terminal: stitch could not assemble the final asset. Mark FAILED so
+        # the job doesn't linger in STITCHING forever.
+        with db.conn() as cx:
+            cx.execute(
+                "UPDATE jobs SET status='FAILED', error=%s WHERE id=%s AND status != 'COMPLETED'",
+                ("stitch stage routed to DLQ after exhausting retries", job_id),
+            )
+            cx.commit()
+        log.error("job=%s sent to stitch.dlq, job marked FAILED", job_id)
         return
 
     delay_ms = int(BACKOFF_SECS[min(attempt, len(BACKOFF_SECS) - 1)] * 1000)

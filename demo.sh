@@ -95,19 +95,23 @@ bold "════════════════════════�
 bold " 3. TTS SEMAPHORE CAP (max 3 concurrent slots)"
 bold "═══════════════════════════════════════════════"
 
-blue "  Submitting 4 jobs simultaneously..."
+# A unique nonce per run guarantees every line is a genuine cache MISS, so TTS
+# actually sleeps (2s) instead of returning instantly from cache. Sustained
+# synthesis is what lets concurrency build past the cap. Submitting 6 jobs ×
+# 2 lines = 12 simultaneous TTS tasks against 5 workers → the cap of 3 engages.
+NONCE="$(date +%s)-$RANDOM"
+blue "  Submitting 6 jobs (unique text → real synthesis) simultaneously..."
 CONCURRENT_IDS=()
-for i in $(seq 1 4); do
-  TEXT="ALICE: Line one for concurrent job $i.
-BOB: Line two for concurrent job $i.
-ALICE: Line three for concurrent job $i."
-  RESP=$(submit_job "$TEXT" "demo-sem-$i-$(date +%s)")
+for i in $(seq 1 6); do
+  TEXT="ALICE: Unique line A job $i nonce $NONCE.
+BOB: Unique line B job $i nonce $NONCE."
+  RESP=$(submit_job "$TEXT" "demo-sem-$i-$NONCE")
   JID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])" 2>/dev/null)
   CONCURRENT_IDS+=("$JID")
   echo "  Submitted job $i: $JID"
 done
 
-blue "  Waiting for all 4 to complete (check logs for semaphore messages)..."
+blue "  Waiting for all 6 to complete (check logs for semaphore messages)..."
 ALL_OK=true
 for jid in "${CONCURRENT_IDS[@]}"; do
   if ! wait_for_status "$jid" "COMPLETED" 180; then
@@ -117,14 +121,35 @@ for jid in "${CONCURRENT_IDS[@]}"; do
 done
 
 if $ALL_OK; then
-  pass "All 4 concurrent jobs completed"
+  pass "All 6 concurrent jobs completed"
+fi
+
+# The cap of 3 must actually engage: we expect to see slots_used=3/3 (cap
+# reached) AND at least one "sem FULL ... waiting" (a 4th request blocked).
+HIGH_WATER=$(docker compose logs worker --tail=500 2>/dev/null \
+  | grep -oE "slots_used=[0-9]+/[0-9]+" | sort -t= -k2 | tail -1 || true)
+FULL_HITS=$(docker compose logs worker --tail=500 2>/dev/null | grep -c "sem FULL" || true)
+
+echo "  High-water mark: $HIGH_WATER"
+echo "  'sem FULL, waiting' events: $FULL_HITS"
+
+if [[ "$HIGH_WATER" == "slots_used=3/3" ]]; then
+  pass "Semaphore reached the cap (3/3) — concurrency limit is being enforced"
+else
+  fail "Cap never reached (high-water=$HIGH_WATER) — semaphore not exercised"
+fi
+
+if [[ "$FULL_HITS" -gt 0 ]]; then
+  pass "At least one request was throttled at the cap ($FULL_HITS 'sem FULL' events)"
+else
+  fail "No throttling observed — 4th concurrent request was never blocked"
 fi
 
 echo ""
-echo "  Semaphore log evidence (last 50 lines):"
-docker compose logs worker --tail=200 2>/dev/null \
-  | grep -E "sem acquired|sem released|slots_used" \
-  | tail -20 \
+echo "  Semaphore log evidence (sample):"
+docker compose logs worker --tail=500 2>/dev/null \
+  | grep -E "sem FULL|slots_used=3/3" \
+  | tail -10 \
   | sed 's/^/    /'
 
 # ── 4. Content cache hit ──────────────────────────────────────────────────────
@@ -151,7 +176,7 @@ echo "  Job B: $CACHE_JOB2"
 wait_for_status "$CACHE_JOB1" "COMPLETED" 120 || true
 wait_for_status "$CACHE_JOB2" "COMPLETED" 120 || true
 
-HITS=$(docker compose logs worker --tail=300 2>/dev/null | grep -c "CACHE HIT" || echo 0)
+HITS=$(docker compose logs worker --tail=300 2>/dev/null | grep -c "CACHE HIT" || true)
 if [[ "$HITS" -gt 0 ]]; then
   pass "CACHE HIT logged $HITS time(s) — duplicate synthesis avoided"
 else
@@ -173,22 +198,80 @@ RPOISON=$(submit_job "$POISON_TEXT" "demo-poison-$(date +%s)")
 POISON_JOB=$(echo "$RPOISON" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])" 2>/dev/null)
 echo "  Submitted poison job: $POISON_JOB"
 
-sleep 8
-
-STATUS=$(job_field "$POISON_JOB" "status")
-echo "  Job status after 8s: $STATUS"
-
-DLQ_COUNT=$(docker compose logs worker --tail=200 2>/dev/null | grep -c "DLQ\|dlq" || echo 0)
-if [[ "$DLQ_COUNT" -gt 0 ]]; then
-  pass "DLQ routing confirmed — $DLQ_COUNT DLQ log entries found"
+# Wait for the job to reach a terminal FAILED state
+if wait_for_status "$POISON_JOB" "FAILED" 30; then
+  ERR=$(job_field "$POISON_JOB" "error")
+  pass "Poison job reached terminal FAILED state — error=\"$ERR\""
 else
-  fail "No DLQ log entries found"
+  fail "Poison job did not reach FAILED (stuck at $(job_field "$POISON_JOB" status))"
 fi
 
-if [[ "$STATUS" != "COMPLETED" ]]; then
-  pass "Poison job not COMPLETED (status=$STATUS) — correctly failed"
+# Confirm the message actually landed in the RabbitMQ DLQ (not just logged)
+DLQ_DEPTH=$(docker compose exec -T rabbitmq rabbitmqctl list_queues name messages 2>/dev/null \
+  | grep "parse.dlq" | awk '{print $2}')
+echo "  parse.dlq depth in RabbitMQ: ${DLQ_DEPTH:-0}"
+if [[ "${DLQ_DEPTH:-0}" -gt 0 ]]; then
+  pass "Message physically present in parse.dlq queue (depth=$DLQ_DEPTH)"
 else
-  fail "Poison job unexpectedly COMPLETED"
+  fail "parse.dlq is empty — message did not reach the DLQ"
+fi
+
+# Prove the queue wasn't blocked: a normal job submitted right after still completes
+NORMAL=$(submit_job "ALICE: A clean job right after the poison one." "demo-after-poison-$(date +%s)")
+NORMAL_JOB=$(echo "$NORMAL" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])" 2>/dev/null)
+if wait_for_status "$NORMAL_JOB" "COMPLETED" 60; then
+  pass "Queue not blocked — a normal job after the poison pill still COMPLETED"
+else
+  fail "Normal job after poison did not complete — queue may be blocked"
+fi
+
+# ── 6. Crash recovery ─────────────────────────────────────────────────────────
+
+bold ""
+bold "═══════════════════════════════════════════════"
+bold " 6. CRASH RECOVERY (docker kill mid-synthesis)"
+bold "═══════════════════════════════════════════════"
+
+# Submit a multi-line job with unique text so synthesis is real (2s/chunk) and
+# sustained, giving us a window to kill a worker WHILE it holds a task.
+CNONCE="democrash-$(date +%s)-$RANDOM"
+CTEXT=""
+for i in $(seq 1 6); do CTEXT="${CTEXT}SPEAKER$i: Crash demo unique line $i $CNONCE.
+"; done
+CRESP=$(submit_job "$CTEXT" "$CNONCE")
+CJOB=$(echo "$CRESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])" 2>/dev/null)
+echo "  Submitted job: $CJOB"
+
+# Catch a worker actively synthesising THIS job and kill it (forceful SIGKILL).
+KILLED=""
+for t in $(seq 1 30); do
+  LINE=$(docker compose logs worker --since=15s 2>/dev/null | grep "synthesising" | grep "$CJOB" | head -1 || true)
+  if [[ -n "$LINE" ]]; then
+    WN=$(echo "$LINE" | awk '{print $1}')
+    KILLED="genai-workflow-${WN}"
+    echo "  >>> $WN is mid-synthesis — docker kill $KILLED"
+    docker kill "$KILLED" >/dev/null 2>&1
+    break
+  fi
+  sleep 0.3
+done
+
+if [[ -z "$KILLED" ]]; then
+  fail "Could not catch a worker mid-synthesis (try increasing job size)"
+else
+  # The orphaned task must be reclaimed by the reaper and the job must still
+  # complete — no message lost, no human intervention.
+  if wait_for_status "$CJOB" "COMPLETED" 90; then
+    pass "Job COMPLETED after worker was forcefully killed mid-processing"
+    RECLAIMS=$(docker compose logs worker --since=120s 2>/dev/null | grep -c "reclaimed + re-emitted" || true)
+    if [[ "$RECLAIMS" -gt 0 ]]; then
+      pass "Reaper reclaimed + re-emitted the orphaned task ($RECLAIMS sweep(s))"
+    else
+      fail "No reaper reclaim logged — recovery path unclear"
+    fi
+  else
+    fail "Job did not recover after worker kill"
+  fi
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -200,11 +283,5 @@ bold "════════════════════════�
 green "  Passed: $PASS"
 [[ $FAIL -gt 0 ]] && red "  Failed: $FAIL" || echo "  Failed: 0"
 bold ""
-
-echo "  Crash recovery (manual test):"
-echo "    docker kill genai-workflow-worker-1"
-echo "    # submit a job, wait ~30s for reaper to fire"
-echo "    docker compose logs worker | grep 'Reaper reclaimed'"
-echo ""
 
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

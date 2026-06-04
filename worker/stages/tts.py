@@ -103,7 +103,7 @@ def handle(
 
     output_key = None
     try:
-        # ── Cache check (with stampede prevention) ────────────────────────────
+        # ── Cache check (with self-healing stampede prevention) ───────────────
         output_key = locks.cache_get(input_hash)
 
         if output_key:
@@ -111,26 +111,38 @@ def handle(
                      job_id, task_id, input_hash[:8], output_key)
 
         else:
-            # Try to become the synthesiser for this hash
-            got_lock = locks.cache_lock_acquire(input_hash)
+            # Loop until we either find the cache populated or become the
+            # synthesiser ourselves. Crucial for crash recovery: if the worker
+            # that holds the stampede lock dies mid-synthesis, its short-TTL
+            # lock expires and we take over — we never wait forever on a dead
+            # peer. (Earlier design waited on cache_wait alone and stranded
+            # survivors for the full lock TTL when the holder crashed.)
+            deadline = time.monotonic() + locks.CACHE_WAIT_TIMEOUT
+            while not output_key and time.monotonic() < deadline:
+                if locks.cache_lock_acquire(input_hash):
+                    try:
+                        output_key = locks.cache_get(input_hash)  # recheck under lock
+                        if not output_key:
+                            output_key = _synthesise(job_id, task_id, speaker, chunk_text)
+                            locks.cache_set(input_hash, output_key)
+                            log.info("job=%s task=%s SYNTHESISED + cached hash=%s",
+                                     job_id, task_id, input_hash[:8])
+                    finally:
+                        locks.cache_lock_release(input_hash)
+                else:
+                    # A peer holds the lock; wait briefly for them to publish.
+                    # Bounded by the lock TTL so a crashed holder can't strand us.
+                    log.info("job=%s task=%s waiting for cache (peer is synthesising)", job_id, task_id)
+                    output_key = locks.cache_wait(input_hash, timeout=locks.CACHE_LOCK_TTL + 2)
+                    if output_key:
+                        log.info("job=%s task=%s cache populated by peer, reusing key=%s",
+                                 job_id, task_id, output_key)
+                    else:
+                        log.warning("job=%s task=%s peer holding cache lock did not publish "
+                                    "(likely crashed) — retrying to take over", job_id, task_id)
 
-            if got_lock:
-                # Double-check cache in case another worker snuck in
-                output_key = locks.cache_get(input_hash)
-                if not output_key:
-                    output_key = _synthesise(job_id, task_id, speaker, chunk_text)
-                    locks.cache_set(input_hash, output_key)
-                    log.info("job=%s task=%s SYNTHESISED + cached hash=%s", job_id, task_id, input_hash[:8])
-                locks.cache_lock_release(input_hash)
-
-            else:
-                # Lost the stampede race — wait for the winner to populate cache
-                log.info("job=%s task=%s waiting for cache (lost stampede race)", job_id, task_id)
-                output_key = locks.cache_wait(input_hash)
-                if not output_key:
-                    raise RuntimeError(f"Cache wait timed out for hash {input_hash[:8]}")
-                log.info("job=%s task=%s cache populated by peer, reusing key=%s",
-                         job_id, task_id, output_key)
+            if not output_key:
+                raise RuntimeError(f"Could not obtain TTS output for hash {input_hash[:8]}")
 
     except Exception as exc:
         log.exception("job=%s task=%s TTS error: %s", job_id, task_id, exc)
@@ -150,7 +162,16 @@ def handle(
     locks.sem_release(holder_id)
 
     # ── Commit task DONE + check if all chunks complete (same tx) ────────────
+    #
+    # Completion-detection race: if two final chunks commit concurrently, under
+    # READ COMMITTED each transaction's snapshot may not see the other's DONE
+    # yet, so BOTH count remaining>=1 and NEITHER flips the job → stuck forever
+    # with all tasks DONE. Fix: take a row lock on the job FIRST (FOR UPDATE),
+    # which serialises the completion check per job. The second finisher blocks
+    # until the first commits, then sees the up-to-date counts.
     with db.conn() as cx:
+        cx.execute("SELECT 1 FROM jobs WHERE id=%s FOR UPDATE", (job_id,))
+
         cx.execute(
             "UPDATE tasks SET status='DONE', output_key=%s, locked_until=NULL WHERE id=%s",
             (output_key, task_id),
@@ -162,8 +183,8 @@ def handle(
         ).fetchone()[0]
 
         if remaining == 0:
-            # Atomically claim the stitch transition — prevents two workers
-            # both seeing remaining=0 and both publishing stitch events
+            # The job row is already locked, so this flip is race-free; the
+            # status guard is belt-and-suspenders against duplicate delivery.
             flipped = cx.execute(
                 "UPDATE jobs SET status='STITCHING' WHERE id=%s AND status='PROCESSING'",
                 (job_id,),
@@ -222,11 +243,24 @@ def _retry_or_dlq(channel, method, msg, attempt):
 
 
 def _send_to_dlq(channel, method, msg):
+    job_id  = msg["job_id"]
+    task_id = msg["task_id"]
     channel.basic_publish(
         exchange="",
         routing_key="tts.dlq",
         body=json.dumps(msg),
         properties=pika.BasicProperties(delivery_mode=2),
     )
-    log.error("job=%s task=%s sent to tts.dlq after exhausting retries", msg["job_id"], msg["task_id"])
+    # A permanently-failed chunk means the drama can't be assembled correctly,
+    # so the whole job is terminal. Mark the task FAILED and fail the job
+    # (unless it already completed). The remaining!=0 guard then prevents any
+    # stitch attempt, and GET /jobs shows a final FAILED status + reason.
+    with db.conn() as cx:
+        cx.execute("UPDATE tasks SET status='FAILED', locked_until=NULL WHERE id=%s", (task_id,))
+        cx.execute(
+            "UPDATE jobs SET status='FAILED', error=%s WHERE id=%s AND status != 'COMPLETED'",
+            (f"TTS chunk {task_id} routed to DLQ after exhausting retries", job_id),
+        )
+        cx.commit()
+    log.error("job=%s task=%s sent to tts.dlq, task+job marked FAILED", job_id, task_id)
     channel.basic_ack(method.delivery_tag)

@@ -102,7 +102,11 @@ services:
       minio:
         condition: service_healthy
     deploy:
-      replicas: 2   # 2 workers to test concurrency + crash recovery
+      # 5 workers: pika consumes one message at a time per process, so worker
+      # count == max parallel TTS attempts. With 5 workers a burst produces 5
+      # simultaneous semaphore acquires → exactly 3 proceed, 2 block. This is
+      # what makes Constraint A (3-concurrent cap) actually observable.
+      replicas: 5
     restart: on-failure
 
 volumes:
