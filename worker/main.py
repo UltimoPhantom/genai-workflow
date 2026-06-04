@@ -17,6 +17,8 @@ import store
 from config import RABBITMQ_URL, WORKER_PREFETCH, LEASE_SECONDS
 from topology import declare_topology, MAIN_EXCHANGE
 from stages.parse import handle as handle_parse
+from stages.tts import handle as handle_tts
+from stages.stitch import handle as handle_stitch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -134,10 +136,11 @@ def start_consumers():
     declare_topology(ch)
     ch.basic_qos(prefetch_count=WORKER_PREFETCH)
 
-    ch.basic_consume("parse.queue", handle_parse, auto_ack=False)
-    # tts and stitch consumers registered in later phases
+    ch.basic_consume("parse.queue",  handle_parse,  auto_ack=False)
+    ch.basic_consume("tts.queue",    handle_tts,    auto_ack=False)
+    ch.basic_consume("stitch.queue", handle_stitch, auto_ack=False)
 
-    log.info("Consumers registered: parse.queue")
+    log.info("Consumers registered: parse.queue, tts.queue, stitch.queue")
     ch.start_consuming()
 
 
