@@ -9,6 +9,7 @@ MINIO_SECRET      = os.environ["MINIO_SECRET_KEY"]
 MINIO_BUCKET      = os.environ.get("MINIO_BUCKET", "genai-pipeline")
 MINIO_USE_SSL     = os.environ.get("MINIO_USE_SSL", "false").lower() == "true"
 
+TTS_SERVICE_URL   = os.environ.get("TTS_SERVICE_URL", "http://tts-service:5050")
 PARSE_FAIL_RATE   = float(os.environ.get("PARSE_FAIL_RATE", "0.15"))
 TTS_MAX_CONCURRENCY = int(os.environ.get("TTS_MAX_CONCURRENCY", "3"))
 TTS_SIMULATE_SECS = float(os.environ.get("TTS_SIMULATE_SECONDS", "2"))

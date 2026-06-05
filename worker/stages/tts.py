@@ -20,12 +20,13 @@ import time
 import uuid
 
 import pika
+import requests as http
 
 import db
 import store
 import locks
 from config import (
-    TTS_SIMULATE_SECS, MAX_RETRIES, BACKOFF_SECS,
+    TTS_SIMULATE_SECS, TTS_SERVICE_URL, MAX_RETRIES, BACKOFF_SECS,
     POISON_TOKEN, LEASE_SECONDS,
 )
 from topology import MAIN_EXCHANGE
@@ -206,15 +207,29 @@ def handle(
 # ── Simulation ─────────────────────────────────────────────────────────────────
 
 def _synthesise(job_id: str, task_id: str, speaker: str, text: str) -> str:
-    """Simulate TTS: sleep, then upload a dummy audio file to MinIO."""
+    """Call the Piper TTS service and upload the returned WAV to MinIO."""
     log.info("job=%s task=%s synthesising speaker=%s len=%d chars",
              job_id, task_id, speaker, len(text))
-    time.sleep(TTS_SIMULATE_SECS)
 
-    # Dummy audio: a text file pretending to be an mp3
-    content = f"[AUDIO] speaker={speaker} text={text}".encode()
-    key     = f"audio/chunks/{job_id}/{task_id}.mp3"
-    store.put_object(key, content, "audio/mpeg")
+    if TTS_SERVICE_URL:
+        resp = http.post(
+            f"{TTS_SERVICE_URL}/synthesise",
+            json={"speaker": speaker, "text": text},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        content      = resp.content
+        content_type = "audio/wav"
+        ext          = "wav"
+    else:
+        # Fallback: simulation mode (no TTS service)
+        time.sleep(TTS_SIMULATE_SECS)
+        content      = f"[AUDIO] speaker={speaker} text={text}".encode()
+        content_type = "audio/mpeg"
+        ext          = "mp3"
+
+    key = f"audio/chunks/{job_id}/{task_id}.{ext}"
+    store.put_object(key, content, content_type)
     return key
 
 

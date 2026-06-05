@@ -109,7 +109,11 @@ def handle(
             task_ids = []
             for seg in segments:
                 task_id    = str(uuid.uuid4())
-                input_hash = hashlib.sha256(seg["text"].encode()).hexdigest()
+                # Cache key includes speaker: different voices for the same text
+                # must not collide (e.g. ALICE "Hi" vs BOB "Hi" → different audio).
+                input_hash = hashlib.sha256(
+                    f"{seg['speaker']}:{seg['text']}".encode()
+                ).hexdigest()
                 cx.execute(
                     """
                     INSERT INTO tasks

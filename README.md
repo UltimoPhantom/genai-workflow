@@ -1,7 +1,8 @@
 # Distributed Multi-Modal GenAI Pipeline
 
 A locally runnable, event-driven microservices pipeline that turns text manuscripts
-into simulated audio dramas. Built with Python · RabbitMQ · PostgreSQL · Redis · MinIO.
+into audio dramas using real neural text-to-speech (Piper). Built with
+Python · RabbitMQ · PostgreSQL · Redis · MinIO · Piper TTS.
 
 ## Architecture
 
@@ -25,7 +26,8 @@ Gateway ──► [outbox] ──► RabbitMQ
          tts.queue (one per chunk)             │
          (Worker: TTS stage)                   │
                │  Redis semaphore (max=3)       │
-               │  Content cache (sha256 hash)   │
+               │  Content cache (speaker+text)  │
+               │  → POST tts-service (Piper)    │
                │  → retry / tts.dlq             │
                ▼                               │
          remaining==0 → outbox ──────────────►─┘
@@ -52,9 +54,10 @@ model, and exhaustive gotcha/edge-case catalog.
 | postgres   | Job/task state, outbox table      | 5433        |
 | redis      | TTS semaphore + content cache     | 6379        |
 | rabbitmq   | Message broker + retry/DLQ queues | 5672 / 15672 (mgmt) |
-| minio      | Manuscript + audio chunk storage  | 9000 / 9001 (console) |
-| gateway    | REST API (FastAPI)                | 8000        |
-| worker     | Pipeline stages (×5 replicas)     | —           |
+| minio       | Manuscript + audio chunk storage  | 9000 / 9001 (console) |
+| tts-service | Piper neural TTS (FastAPI wrapper) | 5050       |
+| gateway     | REST API (FastAPI)                | 8000        |
+| worker      | Pipeline stages (×5 replicas)     | —           |
 
 > **Why 5 workers?** `pika` consumes one message at a time per process, so the
 > worker count *is* the max parallel TTS attempts. With 5 workers a burst of
@@ -142,7 +145,8 @@ without retrying (deterministic failure path for testing).
 |-----------------------|-----------|----------------------------------------------|
 | `PARSE_FAIL_RATE`     | `0.15`    | Fraction of parse attempts that fail (0–1)   |
 | `TTS_MAX_CONCURRENCY` | `3`       | Global cap on simultaneous TTS operations    |
-| `TTS_SIMULATE_SECONDS`| `2`       | Sleep per chunk (simulates vendor latency)   |
+| `TTS_SERVICE_URL`     | `http://tts-service:5050` | Piper TTS endpoint workers call |
+| `TTS_SIMULATE_SECONDS`| `2`       | Fallback sleep per chunk when `TTS_SERVICE_URL` is unset |
 | `LEASE_SECONDS`       | `30`      | Task lock lease; reaper recovers expired leases (synthesis is ~2s, so 30s is a wide safety margin) |
 | `REAPER_INTERVAL_SECONDS` | `10`  | How often the reaper sweeps for expired leases |
 | `MAX_RETRIES`         | `3`       | Attempts before DLQ                          |
