@@ -1,0 +1,68 @@
+### Health check
+GET http://localhost:8000/health
+
+
+### 1. Submit a happy-path job
+POST http://localhost:8000/jobs
+Content-Type: application/json
+Idempotency-Key: test-happy-2
+
+{
+  "manuscript": "ALICE: It was a dark and stormy night.\nBOB: Are you absolutely certain about that?\nALICE: Yes, the thunder shook the windows.\nNARRATOR: And so it began."
+}
+
+
+### 2. Poll job status (replace JOB_ID with id from above response)
+GET http://localhost:8000/jobs/JOB_ID
+
+
+### 3. Idempotency — same key, different text → should return SAME job_id as request 1
+POST http://localhost:8000/jobs
+Content-Type: application/json
+Idempotency-Key: test-happy-1
+
+{
+  "manuscript": "ALICE: This is different text but same idempotency key."
+}
+
+
+### 4. Poison pill — should reach FAILED, message goes to parse.dlq
+POST http://localhost:8000/jobs
+Content-Type: application/json
+Idempotency-Key: test-poison-1
+
+{
+  "manuscript": "ALICE: This manuscript contains POISON and should fail.\nBOB: It will never reach TTS."
+}
+
+
+### 5. Poll poison job status (replace POISON_JOB_ID)
+GET http://localhost:8000/jobs/POISON_JOB_ID
+
+
+### 6. Semaphore burst — submit 3 jobs at once (run all 3 quickly back to back)
+POST http://localhost:8000/jobs
+Content-Type: application/json
+Idempotency-Key: test-burst-1
+
+{
+  "manuscript": "ALICE: Burst job one unique line abc123.\nBOB: Second unique line xyz456."
+}
+
+###
+POST http://localhost:8000/jobs
+Content-Type: application/json
+Idempotency-Key: test-burst-2
+
+{
+  "manuscript": "ALICE: Burst job two unique line def456.\nBOB: Second unique line uvw789."
+}
+
+###
+POST http://localhost:8000/jobs
+Content-Type: application/json
+Idempotency-Key: test-burst-3
+
+{
+  "manuscript": "ALICE: Burst job three unique line ghi789.\nBOB: Second unique line rst012."
+}
