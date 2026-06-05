@@ -92,17 +92,60 @@ def handle(
 
 def _stitch_chunks(job_id: str, chunks: list) -> bytes:
     """
-    Download each chunk's audio from MinIO and concatenate in order.
-    For simulated (dummy) audio files this produces a valid combined file.
+    Download each WAV chunk from MinIO and concatenate into a single valid WAV.
+    Each Piper chunk is 16-bit mono 22050 Hz PCM. We strip each chunk's 44-byte
+    RIFF header, concatenate the raw PCM frames, then write one new RIFF header
+    covering the combined length.
     """
-    parts = []
+    import struct
+    import io
+
+    WAV_HEADER_SIZE = 44  # standard PCM WAV header
+    SILENCE_FRAMES  = b"\x00\x00" * 2205  # ~100ms silence at 22050 Hz 16-bit mono
+
+    pcm_parts = []
+    sample_rate   = 22050
+    num_channels  = 1
+    bits_per_sample = 16
+
     for chunk_index, speaker, chunk_text, output_key in chunks:
         chunk_bytes = store.get_object(output_key)
-        parts.append(chunk_bytes)
-        log.debug("job=%s stitched chunk=%d speaker=%s", job_id, chunk_index, speaker)
+        log.debug("job=%s stitched chunk=%d speaker=%s bytes=%d",
+                  job_id, chunk_index, speaker, len(chunk_bytes))
 
-    # Separator between chunks (would be silence in real audio)
-    return b"\n---\n".join(parts)
+        if chunk_bytes[:4] == b"RIFF":
+            # Strip the WAV header — keep only PCM audio data
+            pcm_parts.append(chunk_bytes[WAV_HEADER_SIZE:])
+        else:
+            # Fallback: simulated dummy audio (not real WAV)
+            pcm_parts.append(chunk_bytes)
+
+        # Add a short silence gap between chunks
+        if chunk_index < len(chunks) - 1:
+            pcm_parts.append(SILENCE_FRAMES)
+
+    raw_pcm    = b"".join(pcm_parts)
+    data_size  = len(raw_pcm)
+    byte_rate  = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_size,       # file size - 8
+        b"WAVE",
+        b"fmt ",
+        16,                   # PCM chunk size
+        1,                    # audio format: PCM
+        num_channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        data_size,
+    )
+    return header + raw_pcm
 
 
 def _notify(job_id: str, final_key: str, chunk_count: int):
